@@ -2,11 +2,12 @@ package database
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -24,8 +25,12 @@ type NextId struct {
 	For string `bson:"_id"`
 	Id  int64  `bson:"next_id"`
 }
+type NextIdCreate struct {
+	For string `bson:"_id"`
+	Id  int64  `bson:"next_id"`
+}
 
-func NewMongo() *mongo.Client {
+func NewMongoClient() *mongo.Client {
 	if err := godotenv.Load(); err != nil {
 		log.Fatal("Error loading .env file")
 	}
@@ -35,20 +40,38 @@ func NewMongo() *mongo.Client {
 		log.Fatalln("MongoDB URI is not set in environment.")
 	}
 
-	db, err := mongo.Connect(options.Client().ApplyURI(uri))
+	mongoClient, err := mongo.Connect(options.Client().ApplyURI(uri))
 	if err != nil {
 		log.Fatalln("Failed to connect to MongoDB:", err)
 	}
-	return db
+	return mongoClient
 }
 
-func AddUser(db *mongo.Client, name, nickname, password string) error {
-	userCollection := db.Database("mydb").Collection("users")
-	nextIdCollection := db.Database("mydb").Collection("next_id")
+func AddUser(ctx context.Context, mongoClient *mongo.Client, redisClient *redis.Client, name, nickname, password string) error {
+	userCollection := mongoClient.Database("mydb").Collection("users")
+	nextIdCollection := mongoClient.Database("mydb").Collection("next_id")
+
+	dbCtx, close := context.WithTimeout(ctx, 5*time.Second)
+	defer close()
 
 	var NextId NextId
-	findErr := nextIdCollection.FindOne(context.TODO(), bson.D{{Key: "_id", Value: "users"}}).Decode(&NextId)
+	findErr := nextIdCollection.FindOne(dbCtx, bson.D{{Key: "_id", Value: "users"}}).Decode(&NextId)
 	if findErr != nil {
+		if dbCtx.Err() != nil {
+			return dbCtx.Err()
+		}
+
+		// check data for initialization
+		if findErr == mongo.ErrNoDocuments {
+			nextIdCreate := NextIdCreate{
+				For: "users",
+				Id:  1,
+			}
+			if _, insertErr := nextIdCollection.InsertOne(dbCtx, nextIdCreate); insertErr != nil {
+				return insertErr
+			}
+		}
+
 		return findErr
 	}
 
@@ -57,28 +80,65 @@ func AddUser(db *mongo.Client, name, nickname, password string) error {
 		return HashErr
 	}
 
-	isRight, verifyErr := VerifyHash(password, passwordHash)
-	if verifyErr != nil {
-		fmt.Println("🔴 Password V-Error:", verifyErr)
-	}
-	fmt.Println("❔ is equals:", isRight)
-
-	fmt.Println("🔢 Password hash:", passwordHash)
-
-	_, insertErr := userCollection.InsertOne(context.TODO(), User{
+	user := User{
 		Id:       NextId.Id,
 		Name:     name,
 		Nickname: nickname,
 		Password: passwordHash,
-	})
+	}
+
+	_, insertErr := userCollection.InsertOne(dbCtx, user)
 	if insertErr != nil {
+		if dbCtx.Err() != nil {
+			return dbCtx.Err()
+		}
 		return insertErr
 	}
 
-	_, updateErr := nextIdCollection.UpdateOne(context.TODO(), bson.D{{Key: "_id", Value: "users"}}, bson.D{{Key: "$inc", Value: bson.D{{Key: "next_id", Value: int64(1)}}}})
+	_, updateErr := nextIdCollection.UpdateOne(dbCtx, bson.D{{Key: "_id", Value: "users"}}, bson.D{{Key: "$inc", Value: bson.D{{Key: "next_id", Value: int64(1)}}}})
 	if updateErr != nil {
+		if dbCtx.Err() != nil {
+			return dbCtx.Err()
+		}
 		log.Fatal("Failed to update next_id:", updateErr)
 	}
 
+	AddUserToCache(ctx, redisClient, NextId.Id, user)
+	AddUserToCache(ctx, redisClient, nickname, user)
+
 	return nil
+}
+
+func FindUserById(ctx context.Context, mongoClient *mongo.Client, id int64) (*User, error) {
+	dbCtx, close := context.WithTimeout(ctx, 5*time.Second)
+	defer close()
+
+	userCollection := mongoClient.Database("mydb").Collection("users")
+	var foundUser User
+	err := userCollection.FindOne(dbCtx, bson.D{{Key: "_id", Value: id}}).Decode(&foundUser)
+
+	if err != nil {
+		if dbCtx.Err() != nil {
+			return &User{}, dbCtx.Err()
+		}
+		return &User{}, err
+	}
+	return &foundUser, nil
+}
+
+func FindUserByNickname(ctx context.Context, mongoClient *mongo.Client, nickname string) (*User, error) {
+	dbCtx, close := context.WithTimeout(ctx, 5*time.Second)
+	defer close()
+
+	userCollection := mongoClient.Database("mydb").Collection("users")
+	var foundUser User
+	err := userCollection.FindOne(dbCtx, bson.D{{Key: "nickname", Value: nickname}}).Decode(&foundUser)
+
+	if err != nil {
+		if dbCtx.Err() != nil {
+			return &User{}, dbCtx.Err()
+		}
+		return &User{}, err
+	}
+	return &foundUser, nil
 }

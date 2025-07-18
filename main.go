@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/rom6n/FiberWebApp/internal/database"
@@ -22,10 +25,15 @@ import (
 )
 
 func main() {
-	db := database.NewMongo()
+	mongoClient := database.NewMongoClient()
+	redisClient := database.NewRedisClient()
+	ctx := context.Background()
+
+	signalCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	defer func() {
-		if err := db.Disconnect(context.TODO()); err != nil {
+		if err := mongoClient.Disconnect(ctx); err != nil {
 			log.Fatalf("Failed to disconnect from MongoDB: %v", err)
 		}
 	}()
@@ -88,7 +96,11 @@ func main() {
 		return c.Download("./static/3d-art-dark-3840x2160-12034.jpg", "abstract-wallpaper.jpg")
 	})
 
-	app.Get("/register", handler.Register(db))
+	app.Get("/register", handler.Register(mongoClient, redisClient))
+
+	app.Get("/profile", handler.Profile(mongoClient, redisClient))
+
+	app.Get("/login", handler.Login(mongoClient, redisClient))
 
 	app.Get("/:name", func(c *fiber.Ctx) error {
 		msg := fmt.Sprintf("<h1>Hello, %v dev!</h1>", c.Params("name"))
@@ -96,5 +108,14 @@ func main() {
 	})
 	//---------------------------------------------------------------
 
-	log.Fatal(app.Listen(":3000"))
+	go func() {
+		<-signalCtx.Done()
+		shutdownCtx, stop := context.WithTimeout(context.Background(), 10*time.Second)
+		fmt.Println("🌳 Graceful Shutdown 🌳")
+		defer stop()
+		app.ShutdownWithContext(shutdownCtx)
+	}()
+
+	app.Listen(":3000")
+
 }
